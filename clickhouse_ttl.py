@@ -466,6 +466,25 @@ class ClickHouse:
             {"db": table.database, "table": table.name},
         )
 
+    def disk_usage(self):
+        return self.select(
+            """SELECT disk, path, total_bytes, free_bytes,
+                       ifNull(active_bytes, 0) AS active_bytes, ifNull(inactive_bytes, 0) AS inactive_bytes
+            FROM (
+                SELECT name AS disk, nullIf(path, '') AS path,
+                       nullIf(total_space, 18446744073709551615) AS total_bytes,
+                       nullIf(free_space, 18446744073709551615) AS free_bytes
+                FROM system.disks
+            ) AS disks
+            FULL OUTER JOIN (
+                SELECT disk_name AS disk,
+                       sumIf(bytes_on_disk, active = 1) AS active_bytes,
+                       sumIf(bytes_on_disk, active = 0) AS inactive_bytes
+                FROM system.parts GROUP BY disk_name
+            ) AS parts USING (disk)
+            ORDER BY disk"""
+        )
+
     def estimate(self, table, expression, partition):
         part_filter = "AND _partition_id = {partition:String}" if partition is not None else ""
         rows = self.select(

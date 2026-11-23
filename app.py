@@ -163,10 +163,13 @@ class App:
         pages.pack(fill="both", expand=True, padx=14, pady=(0, 8))
         manage = ttk.Frame(pages, padding=9, style="Panel.TFrame")
         activity = ttk.Frame(pages, padding=12, style="Panel.TFrame")
+        storage = ttk.Frame(pages, padding=12, style="Panel.TFrame")
         pages.add(manage, text="Таблицы и TTL")
         pages.add(activity, text="Активные запросы")
+        pages.add(storage, text="Место на диске")
         self.build_manage(manage)
         self.build_activity(activity)
+        self.build_storage(storage)
 
         self.status = tk.StringVar(value="Подключитесь к ClickHouse, чтобы загрузить таблицы.")
         ttk.Label(self.root, textvariable=self.status, style="Status.TLabel", anchor="w").pack(
@@ -316,6 +319,32 @@ class App:
         self.query_detail.pack(fill="x", pady=(8, 0))
         self.process_tree.bind("<<TreeviewSelect>>", self.show_process)
 
+    def build_storage(self, parent):
+        bar = ttk.Frame(parent, style="Panel.TFrame")
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(bar, text="Части ClickHouse", style="Title.TLabel").pack(side="left")
+        self.storage_button = ttk.Button(bar, text="Обновить", command=self.load_disk_usage)
+        self.storage_button.pack(side="right")
+
+        self.storage_totals = ttk.Label(parent, text="Статистика дисков ещё не загружена.", style="Hint.TLabel")
+        self.storage_totals.pack(anchor="w", pady=(0, 8))
+        grid, self.storage_parts_tree = tree_panel(parent, (
+            ("disk", "Диск", 160), ("active", "Активные части", 160),
+            ("inactive", "Неактивные части", 160), ("total", "Итого по частям", 160),
+        ), height=5)
+        grid.pack(fill="both", expand=True)
+
+        ttk.Label(parent, text="Ёмкость и свободное место", style="Title.TLabel").pack(anchor="w", pady=(12, 5))
+        grid, self.storage_fs_tree = tree_panel(parent, (
+            ("disk", "Диск", 160), ("total", "Ёмкость", 160), ("free", "Свободно", 160),
+            ("path", "Путь", 280),
+        ), height=5)
+        grid.pack(fill="both", expand=True)
+        ttk.Label(
+            parent, text="Диски на одной файловой системе могут показывать одинаковую ёмкость и свободное место.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+
     def run(self, description, work, apply, error_parent=None):
         if self.busy:
             return
@@ -368,6 +397,7 @@ class App:
             (self.tenant_measure_button, has_tenants),
             (self.tenant_read_entry, has_tenants), (self.tenant_time_entry, has_tenants),
             (self.process_button, self.client),
+            (self.storage_button, self.client),
         ):
             button.configure(state="normal" if idle and allowed else "disabled")
         self.tenant_scope.configure(state="readonly" if idle and has_tenants else "disabled")
@@ -400,6 +430,9 @@ class App:
             self.processes = []
             fill_tree(self.process_tree, ())
             set_text(self.query_detail, "")
+            fill_tree(self.storage_parts_tree, ())
+            fill_tree(self.storage_fs_tree, ())
+            self.storage_totals.configure(text="Статистика дисков ещё не загружена.")
             self.populate_tables(keep=False)
 
         self.run("Подключение и загрузка метаданных…", work, apply)
@@ -665,6 +698,27 @@ class App:
         index = selected_index(self.process_tree)
         if index is not None and index < len(self.processes):
             set_text(self.query_detail, self.processes[index]["query"])
+
+    def load_disk_usage(self):
+        def apply(rows):
+            parts = [(row["disk"], int(row["active_bytes"]), int(row["inactive_bytes"])) for row in rows]
+            active = sum(active_bytes for _, active_bytes, _ in parts)
+            inactive = sum(inactive_bytes for _, _, inactive_bytes in parts)
+            self.storage_totals.configure(
+                text=f"Итого по частям {size_label(active + inactive)}"
+                     f"   ·   Активные {size_label(active)}   ·   Неактивные {size_label(inactive)}"
+            )
+            fill_tree(self.storage_parts_tree, (
+                (disk, size_label(active_bytes), size_label(inactive_bytes), size_label(active_bytes + inactive_bytes))
+                for disk, active_bytes, inactive_bytes in parts
+            ))
+            fill_tree(self.storage_fs_tree, (
+                (row["disk"], size_label(row["total_bytes"]), size_label(row["free_bytes"]), row["path"] or "—")
+                for row in rows
+            ))
+            self.status.set(f"Статистика обновлена. Дисков в выборке: {len(rows)}")
+
+        self.run("Загрузка статистики по дискам…", self.client.disk_usage, apply)
 
 
 class Editor:
