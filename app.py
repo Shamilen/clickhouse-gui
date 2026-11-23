@@ -610,7 +610,10 @@ class Editor:
             raise ValueError("Выберите поддерживаемый столбец даты или времени.")
         rules = tenant_rules(self.tenant_text.get("1.0", "end")) if self.tenant_text else {}
         name, data_type = self.date_columns[column]
-        return expiration(name, data_type, retention_days(self.days.get()), rules)
+        return expiration(
+            name, data_type, retention_days(self.days.get()), rules,
+            server_version=self.app.server["version"],
+        )
 
     def tenant_changed(self, _event):
         if self.tenant_text.edit_modified():

@@ -97,11 +97,16 @@ def time_columns(table, columns):
     return choices
 
 
-def expiration(column, data_type, default_days, rules):
+def expiration(column, data_type, default_days, rules, *, server_version):
     base = identifier(column)
-    # Promote dates before adding days so Date's 16-bit day counter cannot wrap.
-    if data_type in ("Date", "Date32") or data_type in UNIX_SECOND_TYPES:
-        base = f"toDateTime64({base}, 0)"
+    version_match = re.match(r"^([0-9]+)\.([0-9]+)(?:\.|$)", server_version)
+    version = tuple(map(int, version_match.groups())) if version_match else (0, 0)
+    # ClickHouse 25.6 added Date32 and DateTime64 as valid TTL result types.
+    if version >= (25, 6):
+        if data_type in ("Date", "Date32") or data_type in UNIX_SECOND_TYPES:
+            base = f"toDateTime64({base}, 0)"
+    elif data_type == "Date32" or data_type.startswith("DateTime64") or data_type in UNIX_SECOND_TYPES:
+        base = f"toDateTime({base})"
     if not rules:
         return f"{base} + toIntervalDay({default_days})"
     # A single DELETE deadline lets an exception also extend retention.
