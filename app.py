@@ -8,8 +8,8 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from clickhouse_ttl import (
-    ClickHouse, ClickHouseError, expiration, expiration_from_base, materialize_sql,
-    modify_sql, parse_ttl_policy, retention_days, supported_tenant, tenant_rules, time_columns,
+    GIB, SCAN_LIMITS, ClickHouse, ClickHouseError, expiration, expiration_from_base, materialize_sql,
+    modify_sql, parse_ttl_policy, retention_days, supported_tenant, tenant_rules, tenant_scan_limits, time_columns,
 )
 
 
@@ -270,6 +270,18 @@ class App:
         )
         self.tenant_size_button.pack(side="left")
 
+        limits = ttk.Frame(parent, style="Panel.TFrame")
+        limits.pack(fill="x", pady=(0, 8))
+        self.tenant_read_gib = tk.StringVar(value=str(SCAN_LIMITS["max_bytes_to_read"] // GIB))
+        self.tenant_seconds = tk.StringVar(value=str(SCAN_LIMITS["max_execution_time"]))
+        ttk.Label(limits, text="Лимит чтения, ГиБ", style="Hint.TLabel").pack(side="left", padx=(0, 6))
+        self.tenant_read_entry = ttk.Entry(limits, textvariable=self.tenant_read_gib, width=8)
+        self.tenant_read_entry.pack(side="left")
+        ttk.Label(limits, text="0 — без лимита", style="Hint.TLabel").pack(side="left", padx=(6, 12))
+        ttk.Label(limits, text="Время, с", style="Hint.TLabel").pack(side="left", padx=(0, 6))
+        self.tenant_time_entry = ttk.Entry(limits, textvariable=self.tenant_seconds, width=7)
+        self.tenant_time_entry.pack(side="left")
+
         self.measure_tenant_bytes = tk.BooleanVar()
         self.tenant_measure_button = ttk.Checkbutton(
             parent, text="Считать объём без сжатия", variable=self.measure_tenant_bytes,
@@ -354,6 +366,7 @@ class App:
             (self.clean_table_button, has_ttl), (self.mutation_button, merge_tree),
             (self.tenant_parts_button, has_tenants), (self.tenant_size_button, has_tenants),
             (self.tenant_measure_button, has_tenants),
+            (self.tenant_read_entry, has_tenants), (self.tenant_time_entry, has_tenants),
             (self.process_button, self.client),
         ):
             button.configure(state="normal" if idle and allowed else "disabled")
@@ -541,6 +554,12 @@ class App:
         self.tenant_summary.configure(text="")
 
     def load_tenant_sizes(self):
+        try:
+            limits = tenant_scan_limits(self.tenant_read_gib.get(), self.tenant_seconds.get())
+        except ValueError as error:
+            messagebox.showerror("Расчёт по тенантам", str(error), parent=self.root)
+            return
+        self.reset_tenant_sizes()
         table = self.table
         measure_data = self.measure_tenant_bytes.get()
         partition = self.tenant_scope.get() if self.tenant_scope.current() > 0 else None
@@ -548,7 +567,7 @@ class App:
 
         def work():
             self.client.assert_current(table)
-            return self.client.tenant_sizes(table, partition, measure_data=measure_data)
+            return self.client.tenant_sizes(table, partition, measure_data=measure_data, **limits)
 
         def apply(rows):
             if self.table != table:

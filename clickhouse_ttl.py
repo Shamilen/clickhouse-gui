@@ -2,6 +2,7 @@
 
 from base64 import b64encode
 from dataclasses import dataclass
+from decimal import Decimal
 from http.client import HTTPException
 from ipaddress import ip_address
 import json
@@ -21,9 +22,10 @@ SYSTEM_TTL_COLUMNS = (
     "event_date", "event_time", "event_time_microseconds", "finish_date", "finish_time",
 )
 QUERY_PREFIX = "ttl-gui-"
+GIB = 1024 ** 3
 SCAN_LIMITS = {
     "max_execution_time": 25,
-    "max_bytes_to_read": 2 * 1024 ** 3,
+    "max_bytes_to_read": 2 * GIB,
     "read_overflow_mode": "throw",
 }
 TTL_BLOCK = re.compile(r"^TTL\s+(.+?)(?=\n(?:SETTINGS|COMMENT|AS)\b|\Z)", re.M | re.S)
@@ -60,6 +62,33 @@ TTL_DELETE_RULE = re.compile(
 
 class ClickHouseError(RuntimeError):
     """ClickHouse rejected the request or the response could not be verified."""
+
+    def __init__(self, message, *, code=None, query_id=None):
+        super().__init__(message)
+        self.code = code
+        self.query_id = query_id
+
+
+def _clickhouse_error_code(headers, body):
+    header = headers.get("X-ClickHouse-Exception-Code", "")
+    if header.isascii() and header.isdecimal() and int(header):
+        return int(header)
+    match = re.match(r'\s*(?:\{\s*"exception"\s*:\s*")?Code:\s*([0-9]+)\.', body)
+    return int(match[1]) if match else None
+
+
+def tenant_scan_limits(read_gib, time_seconds):
+    read_gib = read_gib.strip().replace(",", ".")
+    time_seconds = time_seconds.strip()
+    read_error = "Введите объём чтения в ГиБ. Значение 0 снимает лимит приложения."
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", read_gib):
+        raise ValueError(read_error)
+    gib = Decimal(read_gib)
+    if gib >= 2 ** 34 or (gib and gib * GIB < 1):
+        raise ValueError(read_error)
+    if not re.fullmatch(r"[0-9]{1,10}", time_seconds) or not 1 <= int(time_seconds) <= 2 ** 31 - 1:
+        raise ValueError("Введите положительное целое время расчёта в секундах.")
+    return {"max_bytes_to_read": int(gib * GIB), "max_execution_time": int(time_seconds)}
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -325,7 +354,7 @@ class ClickHouse:
             handlers.append(ProxyHandler({}))
         self.opener = build_opener(*handlers)
 
-    def _request(self, sql, params=None, settings=None, write=False):
+    def _request(self, sql, params=None, settings=None, write=False, *, timeout=None):
         query_id = QUERY_PREFIX + uuid4().hex
         fields = {"query_id": query_id, "wait_end_of_query": 1}
         fields.update(settings or {})
@@ -334,24 +363,31 @@ class ClickHouse:
             f"{self.url}?{urlencode(fields)}", data=sql.encode(),
             headers={"Authorization": self.authorization, "Content-Type": "text/plain; charset=utf-8"},
         )
+        if timeout is None:
+            timeout = 60 if write else 35
         try:
-            with self.opener.open(request, timeout=60 if write else 35) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", errors="replace")
                 if response.headers.get("X-ClickHouse-Exception-Code", "0") != "0":
-                    raise ClickHouseError(f"{body.strip()}\nquery_id: {query_id}")
+                    raise ClickHouseError(
+                        f"{body.strip()}\nquery_id: {query_id}",
+                        code=_clickhouse_error_code(response.headers, body), query_id=query_id,
+                    )
         except HTTPError as error:
             with error:
                 details = error.read(16_384).decode("utf-8", errors="replace").strip()
-                rejected = error.headers.get("X-ClickHouse-Exception-Code") or re.match(r"Code: \d+\.", details)
-            result = " Исход команды проверьте на сервере." if write and not rejected else ""
-            raise ClickHouseError(f"HTTP {error.code}.{result}\n{details}\nquery_id: {query_id}") from error
+                code = _clickhouse_error_code(error.headers, details)
+            result = " Исход команды проверьте на сервере." if write and code is None else ""
+            raise ClickHouseError(
+                f"HTTP {error.code}.{result}\n{details}\nquery_id: {query_id}", code=code, query_id=query_id,
+            ) from error
         except (URLError, OSError, HTTPException) as error:
             detail = " Исход команды неизвестен, проверьте её на сервере перед повтором." if write else ""
             raise ClickHouseError(f"Ошибка соединения.{detail}\n{error}\nquery_id: {query_id}") from error
         return body, query_id
 
-    def select(self, sql, params=None, settings=None):
-        raw, query_id = self._request(sql + "\nFORMAT JSONEachRow", params, settings)
+    def select(self, sql, params=None, settings=None, *, timeout=None):
+        raw, query_id = self._request(sql + "\nFORMAT JSONEachRow", params, settings, timeout=timeout)
         try:
             return [json.loads(line) for line in raw.split("\n") if line.strip()]
         except json.JSONDecodeError as error:
@@ -439,7 +475,10 @@ class ClickHouse:
         )
         return int(rows[0]["rows"])
 
-    def tenant_sizes(self, table, partition=None, *, measure_data=False):
+    def tenant_sizes(
+        self, table, partition=None, *, measure_data=False,
+        max_bytes_to_read=SCAN_LIMITS["max_bytes_to_read"], max_execution_time=SCAN_LIMITS["max_execution_time"],
+    ):
         weight = "count()"
         data_size = "NULL"
         if measure_data:
@@ -454,8 +493,7 @@ class ClickHouse:
         row_filter = "WHERE source._partition_id = {partition:String}" if partition is not None else ""
         part_filter = "AND partition_id = {partition:String}" if partition is not None else ""
         # Only allocate a part's size when its metadata matches the rows read.
-        return self.select(
-            f"""SELECT tenant, sum(tenant_rows) AS rows, {data_size} AS data_bytes,
+        query = f"""SELECT tenant, sum(tenant_rows) AS rows, {data_size} AS data_bytes,
                    if(countIf(isNull(part_rows) OR part_rows != visible_rows OR part_weight = 0) = 0,
                       toUInt64(round(sum(toFloat64(tenant_weight) / nullIf(part_weight, 0) * part_bytes))),
                       NULL) AS disk_bytes
@@ -477,10 +515,35 @@ class ClickHouse:
                 WHERE active AND database = {{db:String}} AND table = {{table:String}} {part_filter}
             ) AS storage USING (part_name)
             GROUP BY tenant
-            ORDER BY disk_bytes DESC NULLS LAST, data_bytes DESC NULLS LAST, rows DESC, tenant""",
-            {"db": table.database, "table": table.name, "partition": partition or ""},
-            {**SCAN_LIMITS, "max_result_rows": 10_000, "result_overflow_mode": "throw"},
-        )
+            ORDER BY disk_bytes DESC NULLS LAST, data_bytes DESC NULLS LAST, rows DESC, tenant"""
+        settings = {
+            **SCAN_LIMITS,
+            "max_bytes_to_read": max_bytes_to_read,
+            "max_execution_time": max_execution_time,
+            "timeout_overflow_mode": "throw",
+            "max_result_rows": 10_000,
+            "result_overflow_mode": "throw",
+        }
+        try:
+            return self.select(
+                query, {"db": table.database, "table": table.name, "partition": partition or ""},
+                settings, timeout=max(35, max_execution_time + 10),
+            )
+        except ClickHouseError as error:
+            if error.code == 307:
+                message = (
+                    "ClickHouse достиг лимита чтения. Увеличьте «Лимит чтения, ГиБ» или выберите партицию."
+                    if max_bytes_to_read else
+                    "ClickHouse достиг серверного лимита чтения. Выберите партицию или проверьте профиль ClickHouse."
+                )
+            elif error.code == 159:
+                message = "ClickHouse достиг лимита времени. Увеличьте «Время, с» или выберите партицию."
+            else:
+                raise
+            raise ClickHouseError(
+                f"{message}\n\nКод: {error.code}  ·  Query ID: {error.query_id}",
+                code=error.code, query_id=error.query_id,
+            ) from error
 
     def mutations(self, table):
         return self.select(
