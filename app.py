@@ -213,13 +213,13 @@ class App:
         tabs.pack(fill="both", expand=True)
         policy = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         parts = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
-        mutations = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
+        self.mutations_tab = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         ddl = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         self.tenant_tab = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         tabs.add(policy, text="TTL")
         tabs.add(parts, text="Партиции")
         tabs.add(self.tenant_tab, text="Тенанты", state="hidden")
-        tabs.add(mutations, text="Мутации")
+        tabs.add(self.mutations_tab, text="Мутации")
         tabs.add(ddl, text="DDL")
 
         ttk.Label(policy, text="Действующий TTL таблицы", style="Hint.TLabel").pack(anchor="w", pady=(0, 5))
@@ -227,8 +227,16 @@ class App:
         self.current_ttl.pack(fill="both", expand=True)
         self.system_note = ttk.Label(policy, style="Hint.TLabel", wraplength=470, justify="left")
         self.system_note.pack(anchor="w", pady=8)
-        self.edit_button = ttk.Button(policy, text="Настроить TTL", command=self.open_editor, style="Accent.TButton")
-        self.edit_button.pack(anchor="w")
+        policy_actions = ttk.Frame(policy, style="Panel.TFrame")
+        policy_actions.pack(fill="x")
+        self.edit_button = ttk.Button(
+            policy_actions, text="Настроить TTL", command=self.open_editor, style="Accent.TButton",
+        )
+        self.edit_button.pack(side="left")
+        self.clean_system_button = ttk.Button(
+            policy_actions, text="Очистить по текущему TTL",
+            command=lambda: self.clean(True, open_mutations=True),
+        )
 
         actions = ttk.Frame(parts, style="Panel.TFrame")
         actions.pack(fill="x", pady=(0, 8))
@@ -245,13 +253,13 @@ class App:
         grid.pack(fill="both", expand=True)
         self.part_tree.bind("<<TreeviewSelect>>", lambda _: self.update_actions())
 
-        self.mutation_button = ttk.Button(mutations, text="Обновить мутации", command=self.load_mutations)
+        self.mutation_button = ttk.Button(self.mutations_tab, text="Обновить мутации", command=self.load_mutations)
         self.mutation_button.pack(anchor="w", pady=(0, 8))
-        grid, self.mutation_tree = tree_panel(mutations, (
+        grid, self.mutation_tree = tree_panel(self.mutations_tab, (
             ("id", "ID мутации", 116), ("time", "Создана", 136), ("pending", "Части", 64), ("status", "Состояние", 125),
         ))
         grid.pack(fill="both", expand=True)
-        self.mutation_detail = text_panel(mutations, 5)
+        self.mutation_detail = text_panel(self.mutations_tab, 5)
         self.mutation_detail.pack(fill="x", pady=(8, 0))
         self.mutation_tree.bind("<<TreeviewSelect>>", self.show_mutation)
         self.ddl = text_panel(ddl, 16)
@@ -393,6 +401,7 @@ class App:
             (self.parts_button, merge_tree),
             (self.clean_part_button, has_ttl and self.part_tree.selection()),
             (self.clean_table_button, has_ttl), (self.mutation_button, merge_tree),
+            (self.clean_system_button, has_ttl and table.database == "system"),
             (self.tenant_parts_button, has_tenants), (self.tenant_size_button, has_tenants),
             (self.tenant_measure_button, has_tenants),
             (self.tenant_read_entry, has_tenants), (self.tenant_time_entry, has_tenants),
@@ -522,6 +531,10 @@ class App:
             "Постоянный TTL активного системного лога задаётся в конфигурации ClickHouse."
             if table and table.database == "system" else ""
         ))
+        if table and table.database == "system" and table.merge_tree:
+            self.clean_system_button.pack(side="left", padx=(6, 0))
+        else:
+            self.clean_system_button.pack_forget()
         if table:
             ttl = table.ttl
             set_text(self.current_ttl, "TTL не задан." if ttl == "" else ttl or "Не удалось разобрать DDL.")
@@ -619,7 +632,7 @@ class App:
 
         self.run("Расчёт размера по тенантам…", work, apply)
 
-    def clean(self, whole_table):
+    def clean(self, whole_table, *, open_mutations=False):
         if self.busy or not self.table or not self.table.ttl:
             return
         index = selected_index(self.part_tree)
@@ -651,6 +664,10 @@ class App:
             return self.client.change(sql, {"mutations_sync": 0})
 
         def apply(query_id):
+            if open_mutations and self.table == table:
+                self.detail_tabs.select(self.mutations_tab)
+                self.load_mutations(submitted_query_id=query_id)
+                return
             self.status.set(f"Команда принята ClickHouse. Query ID {query_id}")
             messagebox.showinfo("Материализация TTL",
                                 f"Команда принята. Проверьте состояние на вкладке «Мутации».\n\nQuery ID {query_id}",
@@ -658,17 +675,22 @@ class App:
 
         self.run("Отправка MATERIALIZE TTL…", work, apply)
 
-    def load_mutations(self):
+    def load_mutations(self, *, submitted_query_id=None):
         table = self.table
+        detail = f"Команда принята ClickHouse. Query ID {submitted_query_id}" if submitted_query_id else ""
+        if detail:
+            set_text(self.mutation_detail, detail)
 
         def apply(mutations):
+            if self.table != table:
+                return
             self.mutations = mutations
             fill_tree(self.mutation_tree, (
                 (row["mutation_id"], row["create_time"], row["parts_to_do"],
                  "Завершена" if row["is_done"] else "Есть ошибка" if row["latest_fail_reason"] else "В обработке")
                 for row in mutations
             ))
-            set_text(self.mutation_detail, "")
+            set_text(self.mutation_detail, detail)
             self.status.set(f"Мутаций в выборке: {len(mutations)}")
 
         self.run("Загрузка мутаций…", lambda: self.client.mutations(table), apply)
