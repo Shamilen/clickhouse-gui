@@ -186,6 +186,8 @@ class App:
         ttk.Label(bar, text="Таблицы", style="Title.TLabel").pack(side="left")
         self.refresh_button = ttk.Button(bar, text="Обновить", command=self.refresh_tables)
         self.refresh_button.pack(side="right")
+        self.system_ttl_button = ttk.Button(bar, text="TTL для system", command=self.open_system_ttl)
+        self.system_ttl_button.pack(side="right", padx=(0, 6))
         self.filter = tk.StringVar()
         search = ttk.Frame(inventory, style="Panel.TFrame")
         search.pack(fill="x", pady=(0, 9))
@@ -345,6 +347,7 @@ class App:
         has_tenants = bool(table and table.supports_tenant_sizes and "tenant" in self.columns)
         for button, allowed in (
             (self.connect_button, True), (self.refresh_button, self.client),
+            (self.system_ttl_button, self.client),
             (self.edit_button, ttl_known and time_columns(table, self.columns)),
             (self.parts_button, merge_tree),
             (self.clean_part_button, has_ttl and self.part_tree.selection()),
@@ -488,6 +491,17 @@ class App:
         self.editor = Editor(self, self.table)
         self.editor.window.wait_window()
         self.editor = None
+
+    def open_system_ttl(self):
+        if not self.client or self.busy:
+            return
+        editor = SystemTTLEditor(self)
+        self.editor = editor
+        editor.load()
+        editor.window.wait_window()
+        self.editor = None
+        if editor.attempted:
+            self.refresh_tables()
 
     def load_partitions(self):
         table = self.table
@@ -759,7 +773,8 @@ class Editor:
         self.app.run("Подсчёт строк по новому условию TTL…", work, apply, self.window)
 
     def apply(self):
-        sql = modify_sql(self.table, self.expression())
+        expression = self.expression()
+        sql = modify_sql(self.table, expression)
         confirmed = messagebox.askokcancel(
             "Заменить TTL", f"{self.table.host}  ·  {self.table.title}\n\n{sql}\n\n"
             "Все действующие правила TTL таблицы будут заменены. Продолжить?",
@@ -768,16 +783,176 @@ class Editor:
         if not confirmed:
             return
 
-        def work():
-            self.app.client.assert_current(self.table)
-            return self.app.client.change(sql, {"materialize_ttl_after_modify": 0, "mutations_sync": 0})
-
         def done(query_id):
             self.close()
             messagebox.showinfo("TTL изменён", f"ClickHouse принял ALTER.\n\nQuery ID {query_id}", parent=self.app.root)
             self.app.refresh_tables()
 
-        self.app.run("Отправка MODIFY TTL…", work, done, self.window)
+        self.app.run("Отправка MODIFY TTL…", lambda: self.app.client.modify_ttl(self.table, expression),
+                     done, self.window)
+
+    def close(self):
+        if not self.app.busy:
+            self.app.editor = None
+            self.window.destroy()
+
+
+class SystemTTLEditor:
+    def __init__(self, app):
+        self.app = app
+        self.targets = []
+        self.expressions = {}
+        self.outcomes = {}
+        self.attempted = False
+        self.loaded = False
+        self.window = tk.Toplevel(app.root)
+        self.window.title("Установить TTL для system")
+        self.window.geometry("760x660")
+        self.window.minsize(620, 510)
+        self.window.transient(app.root)
+        self.window.grab_set()
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        form = ttk.Frame(self.window, padding=14, style="Panel.TFrame")
+        form.pack(fill="both", expand=True)
+        ttk.Label(form, text=app.server["host"], style="Title.TLabel").pack(anchor="w")
+        ttk.Label(form, text="Таблицы MergeTree в базе system", style="Hint.TLabel").pack(anchor="w", pady=(2, 8))
+
+        fields = ttk.Frame(form, style="Panel.TFrame")
+        fields.pack(fill="x", pady=(0, 8))
+        ttk.Label(fields, text="Хранить дней", style="Hint.TLabel").pack(side="left", padx=(0, 8))
+        self.days = tk.StringVar(value="3")
+        self.days_input = ttk.Entry(fields, textvariable=self.days, width=9)
+        self.days_input.pack(side="left")
+        self.reload_button = ttk.Button(fields, text="Обновить список", command=self.load)
+        self.reload_button.pack(side="right")
+
+        grid, self.tree = tree_panel(form, (
+            ("table", "Таблица", 270), ("column", "Столбец даты", 140), ("status", "Статус", 110),
+        ))
+        grid.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda _: self.show_detail())
+        self.detail = text_panel(form, 8)
+        self.detail.pack(fill="x", pady=(8, 8))
+
+        actions = ttk.Frame(form, style="Panel.TFrame")
+        actions.pack(fill="x")
+        self.notice = ttk.Label(actions, style="Hint.TLabel", wraplength=310, justify="left")
+        self.notice.pack(side="left", fill="x", expand=True)
+        self.apply_button = ttk.Button(actions, text="Установить TTL", command=self.apply, style="Accent.TButton")
+        self.apply_button.pack(side="right")
+        self.close_button = ttk.Button(actions, text="Закрыть", command=self.close)
+        self.close_button.pack(side="right", padx=6)
+        self.days.trace_add("write", self.render)
+        self.render()
+
+    def load(self):
+        def work():
+            targets = self.app.client.system_ttl_targets()
+            if any(target.table.host != self.app.server["host"] for target in targets):
+                raise ClickHouseError("Узел изменился. Подключитесь заново и обновите список.")
+            return targets
+
+        def done(targets):
+            self.targets = targets
+            self.outcomes = {}
+            self.loaded = True
+            self.render()
+            self.app.status.set(f"Таблиц system семейства MergeTree: {len(targets)}")
+
+        self.app.run("Загрузка системных таблиц…", work, done, self.window)
+
+    def render(self, *_):
+        try:
+            days = retention_days(self.days.get())
+        except ValueError as error:
+            self.expressions = {}
+            notice = str(error)
+        else:
+            self.expressions = {
+                target.table.name: expiration(*target.date_column, days, {}, server_version=self.app.server["version"])
+                for target in self.targets if not target.skip_reason
+            }
+            skipped = len(self.targets) - len(self.expressions)
+            if self.outcomes:
+                accepted = sum(ok for ok, _ in self.outcomes.values())
+                notice = f"Принято: {accepted}  ·  Проверить: {len(self.outcomes) - accepted}  ·  Пропущено: {skipped}"
+            elif self.loaded and not self.targets:
+                notice = "Доступных таблиц MergeTree в system нет."
+            elif self.loaded:
+                notice = f"Готово: {len(self.expressions)}  ·  Пропущено: {skipped}"
+            else:
+                notice = "Загрузка списка таблиц…"
+
+        selection = selected_index(self.tree)
+        fill_tree(self.tree, (
+            (target.table.title, target.date_column[0] if target.date_column else "—", self.target_status(target))
+            for target in self.targets
+        ))
+        if self.targets:
+            self.tree.selection_set(str(min(selection or 0, len(self.targets) - 1)))
+        self.notice.configure(text=notice)
+        self.show_detail()
+        self.update_actions()
+
+    def target_status(self, target):
+        if target.skip_reason:
+            return "Пропуск"
+        if target.table.name in self.outcomes:
+            return "Принято" if self.outcomes[target.table.name][0] else "Проверить"
+        return "Готово" if target.table.name in self.expressions else "—"
+
+    def show_detail(self):
+        index = selected_index(self.tree)
+        if index is None:
+            set_text(self.detail, "")
+            return
+        target = self.targets[index]
+        table = target.table
+        old_ttl = "TTL не задан." if table.ttl == "" else table.ttl or "Не удалось разобрать DDL."
+        lines = ["Текущий TTL на момент загрузки", old_ttl]
+        if target.skip_reason:
+            lines.extend(("", target.skip_reason))
+        elif table.name in self.expressions:
+            lines.extend(("", "SET materialize_ttl_after_modify = 0;", modify_sql(table, self.expressions[table.name]) + ";"))
+        if table.name in self.outcomes:
+            ok, detail = self.outcomes[table.name]
+            lines.extend(("", f"Query ID {detail}" if ok else detail))
+        set_text(self.detail, "\n".join(lines))
+
+    def update_actions(self):
+        idle = not self.app.busy
+        editable = idle and not self.outcomes
+        self.days_input.configure(state="normal" if editable else "disabled")
+        self.apply_button.configure(state="normal" if editable and self.expressions else "disabled")
+        for button in (self.reload_button, self.close_button):
+            button.configure(state="normal" if idle else "disabled")
+
+    def apply(self):
+        days = retention_days(self.days.get())
+        changes = [
+            (target.table, self.expressions[target.table.name]) for target in self.targets
+            if target.table.name in self.expressions
+        ]
+        if not changes:
+            return
+        confirmed = messagebox.askokcancel(
+            "Установить TTL для system",
+            f"{self.app.server['host']}\nТаблиц: {len(changes)}  ·  Срок в днях: {days}\n\n"
+            "Действующие правила TTL этих таблиц будут заменены. Автоматическая материализация при ALTER отключена.",
+            icon="warning", default="cancel", parent=self.window,
+        )
+        if not confirmed:
+            return
+        self.attempted = True
+
+        def done(outcomes):
+            self.outcomes = outcomes
+            self.render()
+            self.app.status.set("Пакетное изменение TTL завершено.")
+
+        self.app.run("Применение TTL к системным таблицам…", lambda: self.app.client.modify_ttl_batch(changes),
+                     done, self.window)
 
     def close(self):
         if not self.app.busy:

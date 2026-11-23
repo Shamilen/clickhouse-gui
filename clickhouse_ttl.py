@@ -17,6 +17,9 @@ SYSTEM_LOGS = (
     "query_views_log", "query_log", "asynchronous_metric_log", "text_log",
     "query_metric_log", "error_log",
 )
+SYSTEM_TTL_COLUMNS = (
+    "event_date", "event_time", "event_time_microseconds", "finish_date", "finish_time",
+)
 QUERY_PREFIX = "ttl-gui-"
 SCAN_LIMITS = {
     "max_execution_time": 25,
@@ -169,6 +172,13 @@ class Table:
         )
 
 
+@dataclass(frozen=True)
+class SystemTTLTarget:
+    table: Table
+    date_column: tuple[str, str] | None
+    skip_reason: str = ""
+
+
 class ClickHouse:
     def __init__(self, url, username, password):
         self.url = url.strip()
@@ -228,12 +238,14 @@ class ClickHouse:
         server, = self.select("SELECT version() AS version, hostName() AS host, timezone() AS timezone")
         return server
 
-    def tables(self, database, name=None):
+    def tables(self, database, name=None, *, merge_tree_only=False):
         if name is not None:
             predicate = "database = {db:String} AND name = {name:String}"
         else:
             logs = literal("^(" + "|".join(SYSTEM_LOGS) + ")(_[0-9]+)?$")
             predicate = f"database = {{db:String}} OR (database = 'system' AND match(name, {logs}))"
+        if merge_tree_only:
+            predicate = f"({predicate}) AND endsWith(engine, 'MergeTree')"
         rows = self.select(
             "SELECT database, name, engine, toString(uuid) AS uuid, hostName() AS host,\n"
             "       create_table_query AS ddl, formatQueryOrNull(create_table_query) AS formatted_ddl,\n"
@@ -243,6 +255,32 @@ class ClickHouse:
             {"db": database, "name": name or ""},
         )
         return [Table.from_row(row) for row in rows]
+
+    def system_ttl_targets(self):
+        tables = self.tables("system", merge_tree_only=True)
+        if not tables:
+            return []
+        column_names = ", ".join(map(literal, SYSTEM_TTL_COLUMNS))
+        rows = self.select(
+            f"""SELECT table, name, type FROM system.columns
+                WHERE database = 'system' AND name IN ({column_names})
+                  AND default_kind NOT IN ('ALIAS', 'EPHEMERAL')"""
+        )
+        columns = {}
+        for row in rows:
+            columns.setdefault(row["table"], {})[row["name"]] = row["type"]
+
+        targets = []
+        for table in sorted(tables, key=lambda table: table.name):
+            choices = time_columns(table, columns.get(table.name, {}))
+            date_column = next((choices[name] for name in SYSTEM_TTL_COLUMNS if name in choices), None)
+            if table.formatted_ddl is None:
+                targets.append(SystemTTLTarget(table, date_column, "Не удалось разобрать DDL."))
+            elif date_column is None:
+                targets.append(SystemTTLTarget(table, None, "Нет подходящего столбца даты журнала."))
+            else:
+                targets.append(SystemTTLTarget(table, date_column))
+        return targets
 
     def _column_rows(self, table):
         return self.select(
@@ -336,6 +374,21 @@ class ClickHouse:
         tables = self.tables(snapshot.database, snapshot.name)
         if not tables or not snapshot.same_definition(tables[0]):
             raise ClickHouseError("Узел или определение таблицы изменились. Обновите список и проверьте SQL заново.")
+
+    def modify_ttl(self, table, expression):
+        self.assert_current(table)
+        return self.change(
+            modify_sql(table, expression), {"materialize_ttl_after_modify": 0, "mutations_sync": 0},
+        )
+
+    def modify_ttl_batch(self, changes):
+        outcomes = {}
+        for table, expression in changes:
+            try:
+                outcomes[table.name] = (True, self.modify_ttl(table, expression))
+            except ClickHouseError as error:
+                outcomes[table.name] = (False, str(error))
+        return outcomes
 
 
 def modify_sql(table, expression):
