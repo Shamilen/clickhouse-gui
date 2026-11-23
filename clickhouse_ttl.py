@@ -18,6 +18,11 @@ SYSTEM_LOGS = (
     "query_metric_log", "error_log",
 )
 QUERY_PREFIX = "ttl-gui-"
+SCAN_LIMITS = {
+    "max_execution_time": 25,
+    "max_bytes_to_read": 2 * 1024 ** 3,
+    "read_overflow_mode": "throw",
+}
 TTL_BLOCK = re.compile(r"^TTL\s+(.+?)(?=\n(?:SETTINGS|COMMENT|AS)\b|\Z)", re.M | re.S)
 DATE_TYPE = re.compile(r"(?:Date|Date32|DateTime(?:64)?(?:\([^\n]+\))?)")
 TENANT_TYPES = re.compile(r"(?:String|FixedString\(\d+\)|Enum(?:8|16)\(.+\))")
@@ -151,6 +156,10 @@ class Table:
         return self.engine.endswith("MergeTree")
 
     @property
+    def supports_tenant_sizes(self):
+        return self.merge_tree and self.name in ("spans_v5", "traces_meta_v5")
+
+    @property
     def ttl(self):
         return ttl_from_ddl(self.formatted_ddl)
 
@@ -235,13 +244,15 @@ class ClickHouse:
         )
         return [Table.from_row(row) for row in rows]
 
-    def columns(self, table):
-        rows = self.select(
-            "SELECT name, type FROM system.columns\n"
+    def _column_rows(self, table):
+        return self.select(
+            "SELECT name, type, default_kind FROM system.columns\n"
             "WHERE database = {db:String} AND table = {table:String} ORDER BY position",
             {"db": table.database, "table": table.name},
         )
-        return {row["name"]: row["type"] for row in rows}
+
+    def columns(self, table):
+        return {row["name"]: row["type"] for row in self._column_rows(table)}
 
     def partitions(self, table):
         return self.select(
@@ -257,9 +268,52 @@ class ClickHouse:
         rows = self.select(
             f"SELECT count() AS rows FROM {table.sql_name}\nWHERE ({expression}) <= now() {part_filter}",
             {"partition": partition or ""},
-            {"max_execution_time": 25, "max_bytes_to_read": 2 * 1024 ** 3, "read_overflow_mode": "throw"},
+            SCAN_LIMITS,
         )
         return int(rows[0]["rows"])
+
+    def tenant_sizes(self, table, partition=None, *, measure_data=False):
+        weight = "count()"
+        data_size = "NULL"
+        if measure_data:
+            stored = ", ".join(
+                f"source.{identifier(column['name'])}" for column in self._column_rows(table)
+                if column["default_kind"] not in ("ALIAS", "EPHEMERAL")
+            )
+            if not stored:
+                raise ClickHouseError("У таблицы нет доступных столбцов для расчёта объёма.")
+            weight = f"sum(byteSize({stored}))"
+            data_size = "sum(tenant_weight)"
+        row_filter = "WHERE source._partition_id = {partition:String}" if partition is not None else ""
+        part_filter = "AND partition_id = {partition:String}" if partition is not None else ""
+        # Only allocate a part's size when its metadata matches the rows read.
+        return self.select(
+            f"""SELECT tenant, sum(tenant_rows) AS rows, {data_size} AS data_bytes,
+                   if(countIf(isNull(part_rows) OR part_rows != visible_rows OR part_weight = 0) = 0,
+                      toUInt64(round(sum(toFloat64(tenant_weight) / nullIf(part_weight, 0) * part_bytes))),
+                      NULL) AS disk_bytes
+            FROM (
+                SELECT part_name, tenant, tenant_rows, tenant_weight,
+                       sum(tenant_rows) OVER (PARTITION BY part_name) AS visible_rows,
+                       sum(tenant_weight) OVER (PARTITION BY part_name) AS part_weight
+                FROM (
+                    SELECT source._part AS part_name, source.tenant AS tenant,
+                           count() AS tenant_rows, {weight} AS tenant_weight
+                    FROM {table.sql_name} AS source
+                    {row_filter}
+                    GROUP BY source._part, source.tenant
+                )
+            ) AS sizes
+            LEFT JOIN (
+                SELECT name AS part_name, toNullable(rows) AS part_rows, bytes_on_disk AS part_bytes
+                FROM system.parts
+                WHERE active AND database = {{db:String}} AND table = {{table:String}} {part_filter}
+            ) AS storage USING (part_name)
+            GROUP BY tenant
+            ORDER BY disk_bytes DESC NULLS LAST, data_bytes DESC NULLS LAST, rows DESC, tenant""",
+            {"db": table.database, "table": table.name, "partition": partition or ""},
+            {**SCAN_LIMITS, "max_result_rows": 10_000, "result_overflow_mode": "throw"},
+        )
 
     def mutations(self, table):
         return self.select(

@@ -88,7 +88,7 @@ def configure_styles(root):
     style = ttk.Style()
     style.theme_use("clam")
     style.configure(".", font="TkDefaultFont", background=BG, foreground=INK)
-    for theme in ("TFrame", "TLabel", "TNotebook"):
+    for theme in ("TFrame", "TLabel", "TNotebook", "TCheckbutton"):
         style.configure("Panel." + theme, background=PANEL)
     style.configure("Title.TLabel", background=PANEL, font=("TkDefaultFont", 15, "bold"))
     style.configure("Hint.TLabel", background=PANEL, foreground=MUTED)
@@ -204,13 +204,16 @@ class App:
         self.table_summary = ttk.Label(detail, style="Hint.TLabel")
         self.table_summary.pack(anchor="w", pady=(1, 7))
         tabs = ttk.Notebook(detail, style="Panel.TNotebook")
+        self.detail_tabs = tabs
         tabs.pack(fill="both", expand=True)
         policy = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         parts = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         mutations = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         ddl = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
+        self.tenant_tab = ttk.Frame(tabs, padding=10, style="Panel.TFrame")
         tabs.add(policy, text="TTL")
         tabs.add(parts, text="Партиции")
+        tabs.add(self.tenant_tab, text="Тенанты", state="hidden")
         tabs.add(mutations, text="Мутации")
         tabs.add(ddl, text="DDL")
 
@@ -248,6 +251,39 @@ class App:
         self.mutation_tree.bind("<<TreeviewSelect>>", self.show_mutation)
         self.ddl = text_panel(ddl, 16)
         self.ddl.pack(fill="both", expand=True)
+        self.build_tenants(self.tenant_tab)
+
+    def build_tenants(self, parent):
+        controls = ttk.Frame(parent, style="Panel.TFrame")
+        controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(controls, text="Область", style="Hint.TLabel").pack(side="left", padx=(0, 8))
+        self.tenant_scope = ttk.Combobox(controls, values=("Вся таблица",), state="readonly", width=15)
+        self.tenant_scope.current(0)
+        self.tenant_scope.pack(side="left")
+        self.tenant_scope.bind("<<ComboboxSelected>>", lambda _: self.reset_tenant_sizes())
+        self.tenant_parts_button = ttk.Button(controls, text="Загрузить партиции", command=self.load_partitions)
+        self.tenant_parts_button.pack(side="left", padx=6)
+        self.tenant_size_button = ttk.Button(
+            controls, text="Посчитать", command=self.load_tenant_sizes, style="Accent.TButton",
+        )
+        self.tenant_size_button.pack(side="left")
+
+        self.measure_tenant_bytes = tk.BooleanVar()
+        self.tenant_measure_button = ttk.Checkbutton(
+            parent, text="Считать объём без сжатия", variable=self.measure_tenant_bytes,
+            command=self.reset_tenant_sizes, style="Panel.TCheckbutton",
+        )
+        self.tenant_measure_button.pack(anchor="w")
+        self.tenant_method = ttk.Label(parent, style="Hint.TLabel", wraplength=430, justify="left")
+        self.tenant_method.pack(anchor="w", pady=(2, 8))
+        grid, self.tenant_tree = tree_panel(parent, (
+            ("tenant", "Tenant", 130), ("rows", "Строки", 82),
+            ("data", "Без сжатия", 110), ("disk", "На диске, оценка", 132),
+        ))
+        grid.pack(fill="both", expand=True)
+        self.tenant_summary = ttk.Label(parent, style="Hint.TLabel", wraplength=430, justify="left")
+        self.tenant_summary.pack(anchor="w", pady=(6, 0))
+        self.reset_tenant_sizes()
 
     def build_activity(self, parent):
         bar = ttk.Frame(parent, style="Panel.TFrame")
@@ -306,15 +342,19 @@ class App:
         merge_tree = bool(table and table.merge_tree)
         ttl_known = bool(merge_tree and table.formatted_ddl is not None)
         has_ttl = bool(ttl_known and table.ttl)
+        has_tenants = bool(table and table.supports_tenant_sizes and "tenant" in self.columns)
         for button, allowed in (
             (self.connect_button, True), (self.refresh_button, self.client),
             (self.edit_button, ttl_known and time_columns(table, self.columns)),
             (self.parts_button, merge_tree),
             (self.clean_part_button, has_ttl and self.part_tree.selection()),
             (self.clean_table_button, has_ttl), (self.mutation_button, merge_tree),
+            (self.tenant_parts_button, has_tenants), (self.tenant_size_button, has_tenants),
+            (self.tenant_measure_button, has_tenants),
             (self.process_button, self.client),
         ):
             button.configure(state="normal" if idle and allowed else "disabled")
+        self.tenant_scope.configure(state="readonly" if idle and has_tenants else "disabled")
         if self.editor:
             self.editor.update_actions()
 
@@ -402,6 +442,8 @@ class App:
             def apply(columns):
                 if self.table == table:
                     self.columns = columns
+                    if table.supports_tenant_sizes and "tenant" not in columns:
+                        self.tenant_summary.configure(text="В таблице нет столбца tenant.")
                     self.status.set(f"Выбрана {table.title}")
                     self.update_actions()
 
@@ -413,6 +455,13 @@ class App:
         self.partitions = []
         self.mutations = []
         fill_tree(self.part_tree, ())
+        self.tenant_scope.configure(values=("Вся таблица",))
+        self.tenant_scope.current(0)
+        self.reset_tenant_sizes()
+        if table and table.supports_tenant_sizes:
+            self.detail_tabs.add(self.tenant_tab)
+        else:
+            self.detail_tabs.hide(self.tenant_tab)
         fill_tree(self.mutation_tree, ())
         set_text(self.mutation_detail, "")
         self.table_title.configure(text=table.title if table else "Выберите таблицу")
@@ -444,6 +493,8 @@ class App:
         table = self.table
 
         def apply(partitions):
+            if self.table != table:
+                return
             self.partitions = partitions
             fill_tree(self.part_tree, (
                 (part["partition_id"], part["label"], size_label(part["size"]), count_label(part["rows"]),
@@ -451,10 +502,56 @@ class App:
                  part["ttl_max"] if not part["ttl_max"].startswith("1970-01-01") else "—")
                 for part in partitions
             ))
+            scope = self.tenant_scope.get()
+            scopes = ("Вся таблица", *(part["partition_id"] for part in partitions))
+            self.tenant_scope.configure(values=scopes)
+            self.tenant_scope.current(scopes.index(scope) if scope in scopes else 0)
+            if self.tenant_scope.get() != scope:
+                self.reset_tenant_sizes()
             self.status.set(f"Активных партиций: {len(partitions)}")
             self.update_actions()
 
         self.run("Загрузка активных партиций…", lambda: self.client.partitions(table), apply)
+
+    def reset_tenant_sizes(self):
+        measure_data = self.measure_tenant_bytes.get()
+        method = (
+            "Размер каждой части распределяется по объёму данных тенантов. Расчёт читает столбцы таблицы."
+            if measure_data else
+            "Размер каждой части распределяется по числу строк тенантов. Расчёт читает столбец tenant."
+        )
+        self.tenant_method.configure(text=method)
+        self.tenant_tree.configure(displaycolumns=("tenant", "rows", "data", "disk") if measure_data
+                                   else ("tenant", "rows", "disk"))
+        fill_tree(self.tenant_tree, ())
+        self.tenant_summary.configure(text="")
+
+    def load_tenant_sizes(self):
+        table = self.table
+        measure_data = self.measure_tenant_bytes.get()
+        partition = self.tenant_scope.get() if self.tenant_scope.current() > 0 else None
+        scope = f"Партиция {partition}" if partition is not None else "Вся таблица"
+
+        def work():
+            self.client.assert_current(table)
+            return self.client.tenant_sizes(table, partition, measure_data=measure_data)
+
+        def apply(rows):
+            if self.table != table:
+                return
+            fill_tree(self.tenant_tree, (
+                ("⟨NULL⟩" if row["tenant"] is None else str(row["tenant"]) or "⟨пусто⟩",
+                 count_label(row["rows"]), size_label(row["data_bytes"]), size_label(row["disk_bytes"]))
+                for row in rows
+            ))
+            total_rows = count_label(sum(int(row["rows"]) for row in rows))
+            summary = f"{scope}   ·   Тенантов: {len(rows)}   ·   Строк: {total_rows}"
+            if any(row["disk_bytes"] is None for row in rows):
+                summary += "\n«—» означает, что для части строк не удалось сопоставить размер части."
+            self.tenant_summary.configure(text=summary)
+            self.status.set("Расчёт по тенантам завершён.")
+
+        self.run("Расчёт размера по тенантам…", work, apply)
 
     def clean(self, whole_table):
         if self.busy or not self.table or not self.table.ttl:
