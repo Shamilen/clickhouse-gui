@@ -8,8 +8,8 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from clickhouse_ttl import (
-    ClickHouse, ClickHouseError, expiration, materialize_sql,
-    modify_sql, retention_days, supported_tenant, tenant_rules, time_columns,
+    ClickHouse, ClickHouseError, expiration, expiration_from_base, materialize_sql,
+    modify_sql, parse_ttl_policy, retention_days, supported_tenant, tenant_rules, time_columns,
 )
 
 
@@ -661,6 +661,13 @@ class Editor:
 
         self.date_columns = time_columns(table, app.columns)
         self.can_use_tenants = table.database != "system" and supported_tenant(app.columns.get("tenant", ""))
+        policy = parse_ttl_policy(table.ttl)
+        current_column = None
+        if policy and (self.can_use_tenants or not policy.rules):
+            current_column = next(
+                (label for label, (name, _) in self.date_columns.items() if name == policy.column), None,
+            )
+        self.current_policy = policy if current_column is not None else None
         form = ttk.Frame(self.window, padding=14, style="Panel.TFrame")
         form.pack(fill="both", expand=True)
         ttk.Label(form, text=table.title, style="Title.TLabel").pack(anchor="w")
@@ -676,8 +683,12 @@ class Editor:
         ttk.Label(fields, text="Столбец даты", style="Hint.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(fields, text="Хранить дней", style="Hint.TLabel").grid(row=0, column=1, sticky="w")
         preferred = {"traces_meta_v5": "max_start_time", "spans_v5": "start_time"}.get(table.name, "event_date")
-        self.column = tk.StringVar(value=preferred if preferred in self.date_columns else "")
-        self.days = tk.StringVar()
+        if self.current_policy:
+            self.column = tk.StringVar(value=current_column)
+            self.days = tk.StringVar(value=str(self.current_policy.default_days))
+        else:
+            self.column = tk.StringVar(value=preferred if preferred in self.date_columns else "")
+            self.days = tk.StringVar()
         choice = ttk.Combobox(fields, textvariable=self.column, values=tuple(self.date_columns), state="readonly", width=26)
         choice.grid(row=1, column=0, sticky="w", padx=(0, 10))
         ttk.Entry(fields, textvariable=self.days, width=12).grid(row=1, column=1, sticky="w")
@@ -688,6 +699,9 @@ class Editor:
                       style="Hint.TLabel").pack(anchor="w", pady=(0, 4))
             self.tenant_text = text_panel(form, 3, editable=True)
             self.tenant_text.pack(fill="x")
+            if self.current_policy:
+                self.tenant_text.insert("1.0", self.current_policy.rules_text)
+                self.tenant_text.edit_modified(False)
             presets = ttk.Frame(form, style="Panel.TFrame")
             presets.pack(fill="x", pady=(4, 8))
             ttk.Button(presets, text="Шаблон sage", command=lambda: self.preset("sage=3")).pack(side="left")
@@ -721,8 +735,11 @@ class Editor:
             raise ValueError("Выберите поддерживаемый столбец даты или времени.")
         rules = tenant_rules(self.tenant_text.get("1.0", "end")) if self.tenant_text else {}
         name, data_type = self.date_columns[column]
+        days = retention_days(self.days.get())
+        if self.current_policy and self.current_policy.column == name:
+            return expiration_from_base(self.current_policy.base, days, rules)
         return expiration(
-            name, data_type, retention_days(self.days.get()), rules,
+            name, data_type, days, rules,
             server_version=self.app.server["version"],
         )
 
@@ -742,7 +759,10 @@ class Editor:
             sql = modify_sql(self.table, self.expression())
         except ValueError as error:
             self.valid = False
-            self.notice.set(str(error))
+            if self.table.ttl and not self.current_policy and not self.days.get().strip():
+                self.notice.set("Текущий TTL использует другой формат. Заполните поля вручную, чтобы заменить правило.")
+            else:
+                self.notice.set(str(error))
             set_text(self.preview, "")
         else:
             self.valid = True

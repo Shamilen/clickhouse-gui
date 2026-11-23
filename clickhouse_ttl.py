@@ -31,6 +31,31 @@ DATE_TYPE = re.compile(r"(?:Date|Date32|DateTime(?:64)?(?:\([^\n]+\))?)")
 TENANT_TYPES = re.compile(r"(?:String|FixedString\(\d+\)|Enum(?:8|16)\(.+\))")
 SIMPLE_AGGREGATE_TYPE = re.compile(r"SimpleAggregateFunction\([^,]+,\s*(.+)\)")
 UNIX_SECOND_TYPES = {"Int32", "UInt32", "Int64", "UInt64"}
+TTL_IDENTIFIER = r"""(?:[A-Za-z_][A-Za-z_0-9]*|`(?:\\.|``|[^`\\])+`|"(?:\\.|""|[^"\\])+")"""
+TTL_STRING = r"'(?:\\.|''|[^'\\])*'"
+TTL_TENANT = r"""(?:tenant|`tenant`|"tenant")"""
+TTL_CAST = re.compile(
+    rf"(toDateTime(?:64)?)\s*\(\s*({TTL_IDENTIFIER})\s*(?:,\s*([0-9])\s*)?\)"
+)
+TTL_DATE_BASE = (
+    rf"(?P<base>toDateTime\s*\(\s*{TTL_IDENTIFIER}\s*\)|"
+    rf"toDateTime64\s*\(\s*{TTL_IDENTIFIER}\s*,\s*[0-9]\s*\)|{TTL_IDENTIFIER})"
+)
+TTL_MULTI_IF = re.compile(
+    rf"\s*{TTL_DATE_BASE}\s*\+\s*toIntervalDay\s*\(\s*multiIf\s*\((?P<arguments>.*)\)"
+    r"\s*\)\s*(?:(?i:DELETE))?\s*",
+    re.S,
+)
+TTL_MULTI_IF_RULE = re.compile(
+    rf"\s*ifNull\s*\(\s*toString\s*\(\s*{TTL_TENANT}\s*\)\s*=\s*(?P<tenant>{TTL_STRING})"
+    r"\s*,\s*0\s*\)\s*,\s*(?P<days>[0-9]+)\s*,"
+)
+TTL_DELETE_RULE = re.compile(
+    rf"\s*{TTL_DATE_BASE}\s*\+\s*(?:toIntervalDay\s*\(\s*(?P<days>[0-9]+)\s*\)|"
+    r"(?i:INTERVAL)\s+(?P<interval_days>[0-9]+)\s+(?i:DAY)\b)"
+    rf"(?:\s*(?i:DELETE)\b)?(?:\s+(?i:WHERE)\s+{TTL_TENANT}\s*=\s*(?P<tenant>{TTL_STRING}))?"
+    r"\s*(?:,(?=\s*\S)|\Z)"
+)
 
 
 class ClickHouseError(RuntimeError):
@@ -115,6 +140,10 @@ def expiration(column, data_type, default_days, rules, *, server_version):
             base = f"toDateTime64({base}, 0)"
     elif data_type == "Date32" or data_type.startswith("DateTime64") or data_type in UNIX_SECOND_TYPES:
         base = f"toDateTime({base})"
+    return expiration_from_base(base, default_days, rules)
+
+
+def expiration_from_base(base, default_days, rules):
     if not rules:
         return f"{base} + toIntervalDay({default_days})"
     # A single DELETE deadline lets an exception also extend retention.
@@ -123,6 +152,106 @@ def expiration(column, data_type, default_days, rules, *, server_version):
         arguments.extend((f"ifNull(toString(tenant) = {literal(tenant)}, 0)", str(days)))
     arguments.append(str(default_days))
     return f"{base} + toIntervalDay(multiIf(\n    " + ",\n    ".join(arguments) + "\n))"
+
+
+@dataclass(frozen=True)
+class EditableTTL:
+    column: str
+    base: str
+    default_days: int
+    rules: dict[str, int]
+
+    @property
+    def rules_text(self):
+        return "\n".join(f"{tenant}={days}" for tenant, days in self.rules.items())
+
+
+def _ttl_token_value(token):
+    if token[0] not in "'\"`":
+        return token
+    quote = token[0]
+    escapes = {"\\": "\\", "'": "'", '"': '"', "`": "`", "n": "\n", "r": "\r", "t": "\t", "0": "\0"}
+
+    def unescape(match):
+        escaped = match.group(1)
+        if escaped is None:
+            return quote
+        if escaped not in escapes:
+            raise ValueError("Unsupported SQL escape")
+        return escapes[escaped]
+
+    return re.sub(rf"{quote}{quote}|\\(.)", unescape, token[1:-1], flags=re.S)
+
+
+def _ttl_base_parts(base):
+    conversion = TTL_CAST.fullmatch(base)
+    if not conversion:
+        column = _ttl_token_value(base)
+        return column, identifier(column)
+    function, token, precision = conversion.groups()
+    column = _ttl_token_value(token)
+    arguments = identifier(column)
+    if precision is not None:
+        arguments += f", {precision}"
+    return column, f"{function}({arguments})"
+
+
+def _editable_ttl(base, default_days, pairs):
+    rules = dict(pairs)
+    policy = EditableTTL(*base, default_days, rules)
+    if len(rules) != len(pairs) or tenant_rules(policy.rules_text) != rules:
+        return None
+    return policy
+
+
+def _parse_multi_if_ttl(match):
+    arguments = match["arguments"]
+    pairs = []
+    offset = 0
+    while rule := TTL_MULTI_IF_RULE.match(arguments, offset):
+        pairs.append((_ttl_token_value(rule["tenant"]), retention_days(rule["days"])))
+        offset = rule.end()
+    if not pairs:
+        return None
+    return _editable_ttl(_ttl_base_parts(match["base"]), retention_days(arguments[offset:]), pairs)
+
+
+def _parse_delete_ttl(expression):
+    base = None
+    default_days = None
+    pairs = []
+    offset = 0
+    while offset < len(expression):
+        rule = TTL_DELETE_RULE.match(expression, offset)
+        if rule is None:
+            return None
+        rule_base = _ttl_base_parts(rule["base"])
+        if base is not None and rule_base != base:
+            return None
+        base = rule_base
+        days = retention_days(rule["days"] or rule["interval_days"])
+        if rule["tenant"] is not None:
+            pairs.append((_ttl_token_value(rule["tenant"]), days))
+        elif default_days is None:
+            default_days = days
+        else:
+            return None
+        offset = rule.end()
+    # An unconditional DELETE is a ceiling for the conditional DELETE rules.
+    if default_days is None or any(days > default_days for _, days in pairs):
+        return None
+    return _editable_ttl(base, default_days, pairs)
+
+
+def parse_ttl_policy(expression):
+    """Read only TTL forms that the editor can reproduce as a single deadline."""
+    if not expression:
+        return None
+    try:
+        multi_if = TTL_MULTI_IF.fullmatch(expression)
+        return _parse_multi_if_ttl(multi_if) if multi_if else _parse_delete_ttl(expression)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
